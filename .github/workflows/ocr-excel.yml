@@ -1,0 +1,110 @@
+name: Payslip Automation OCR to Excel
+
+on:
+  push:
+    paths:
+      - '**.jpg'
+      - '**.jpeg'
+      - '**.png'
+
+jobs:
+  ocr:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repo
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        pip install openpyxl pillow pytesseract
+
+    - name: Install Tesseract
+      run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+
+    - name: Process Payslip
+      run: |
+        python <<'EOF'
+        import pytesseract, os, re
+        from PIL import Image
+        from openpyxl import load_workbook
+        from pathlib import Path
+
+        # 1. 读取 prompt.txt（规则说明）
+        prompt_path = 'prompt.txt'
+        if Path(prompt_path).exists():
+            with open(prompt_path, 'r', encoding='utf-8') as f:
+                rules = f.read()
+            print("✅ 读取 prompt.txt 规则成功")
+        else:
+            print("⚠️ 没有 prompt.txt，使用默认规则")
+            rules = ""
+
+        # 2. 找图片
+        files = [f for f in os.listdir('.') if f.lower().endswith(('.jpg','.jpeg','.png'))]
+        if not files:
+            raise SystemExit("❌ 没有找到 payslip 图片")
+        img_file = files[0]
+        print(f"OCR 目标: {img_file}")
+
+        # 3. OCR识别
+        text = pytesseract.image_to_string(Image.open(img_file), lang='eng')
+        print("✅ OCR 结果：")
+        print(text)
+
+        # 4. 提取 Staff Code 和工资字段（示例）
+        def find_value(pattern):
+            match = re.search(pattern, text)
+            return match.group(1) if match else None
+
+        staff_code = find_value(r"(AF\d{4}|AA\d{2}|A\d{3})") or "UNKNOWN"
+        basic_pay = find_value(r"Basic\s*Pay\s*([\d\.]+)")
+        ot_hours = find_value(r"HRS/DAY\s*([\d\.]+)")
+        ot_amount = find_value(r"AMOUNT\s*([\d\.]+)")
+        nett_pay = find_value(r"Nett\s*Pay\s*([\d\.]+)")
+
+        print(f"✅ Staff Code: {staff_code}")
+        print(f"✅ Basic Pay: {basic_pay}")
+        print(f"✅ OT Hours: {ot_hours}")
+        print(f"✅ OT Amount: {ot_amount}")
+        print(f"✅ Nett Pay: {nett_pay}")
+
+        # 5. 加载 Excel 模板
+        template = 'SA - Empty.xlsx'
+        if not Path(template).exists():
+            raise SystemExit("❌ 没有找到 Excel 模板")
+        wb = load_workbook(template)
+        ws = wb.active
+
+        # 6. 查找 Staff Code 对应行
+        row = None
+        for r in range(2, ws.max_row+1):
+            if ws[f"A{r}"].value and str(ws[f"A{r}"].value).strip() == staff_code:
+                row = r
+                break
+        if not row:
+            raise SystemExit(f"❌ Staff Code {staff_code} 不存在于模板")
+
+        # 7. 写入对应列（E=Basic Pay, H=OT Hours, I=OT Amount, AK=Nett Pay）
+        if basic_pay: ws[f"E{row}"] = float(basic_pay)
+        if ot_hours: ws[f"H{row}"] = float(ot_hours)
+        if ot_amount: ws[f"I{row}"] = float(ot_amount)
+        if nett_pay: ws[f"AK{row}"] = float(nett_pay)
+
+        output_file = 'SA - Updated.xlsx'
+        wb.save(output_file)
+        print(f"✅ 生成文件：{output_file}")
+        EOF
+
+    - name: Commit Excel
+      run: |
+        git config --global user.name "chatgpt-bot"
+        git config --global user.email "bot@example.com"
+        git add "SA - Updated.xlsx"
+        git commit -m "Auto generated Excel from payslip" || echo "No changes"
+        git push
