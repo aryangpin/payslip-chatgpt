@@ -13,98 +13,138 @@ jobs:
 
     steps:
     - name: Checkout Repo
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
     - name: Install dependencies
       run: |
+        pip install --upgrade pip
         pip install openpyxl pillow pytesseract
 
     - name: Install Tesseract
-      run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y tesseract-ocr
 
     - name: Process Payslip
       run: |
         python <<'EOF'
-        import pytesseract, os, re
-        from PIL import Image
-        from openpyxl import load_workbook
+        import os, re, glob
         from pathlib import Path
+        from PIL import Image
+        import pytesseract
+        from openpyxl import load_workbook
 
-        # 1. 读取 prompt.txt（规则说明）
-        prompt_path = 'prompt.txt'
-        if Path(prompt_path).exists():
-            with open(prompt_path, 'r', encoding='utf-8') as f:
-                rules = f.read()
-            print("✅ 读取 prompt.txt 规则成功")
+        # ========== 工具函数 ==========
+        def find_first_image():
+          imgs = sorted([p for p in os.listdir('.') if p.lower().endswith(('.jpg','.jpeg','.png'))])
+          if not imgs:
+            raise SystemExit("❌ 没找到图片文件")
+          return imgs[-1]  # 取最新一张（按名字排序的最后一个）
+
+        def num(s):
+          if s is None: return None
+          s = s.replace(',', '').strip()
+          try:
+            return float(s)
+          except:
+            return None
+
+        def find(patterns, text, flags=re.IGNORECASE):
+          if isinstance(patterns, str):
+            patterns = [patterns]
+          for pat in patterns:
+            m = re.search(pat, text, flags)
+            if m:
+              return m.group(1)
+          return None
+
+        # ========== 读取 prompt.txt（可选） ==========
+        rules = ""
+        if Path("prompt.txt").exists():
+          rules = Path("prompt.txt").read_text(encoding="utf-8", errors="ignore")
+          print("✅ 读取 prompt.txt 成功")
         else:
-            print("⚠️ 没有 prompt.txt，使用默认规则")
-            rules = ""
+          print("⚠️ 没有 prompt.txt，使用内置默认规则")
 
-        # 2. 找图片
-        files = [f for f in os.listdir('.') if f.lower().endswith(('.jpg','.jpeg','.png'))]
-        if not files:
-            raise SystemExit("❌ 没有找到 payslip 图片")
-        img_file = files[0]
-        print(f"OCR 目标: {img_file}")
-
-        # 3. OCR识别
+        # ========== OCR ==========
+        img_file = find_first_image()
+        print(f"🎯 OCR 目标: {img_file}")
         text = pytesseract.image_to_string(Image.open(img_file), lang='eng')
-        print("✅ OCR 结果：")
-        print(text)
+        print("📄 OCR 文本（前400字）：\n" + text[:400])
 
-        # 4. 提取 Staff Code 和工资字段（示例）
-        def find_value(pattern):
-            match = re.search(pattern, text)
-            return match.group(1) if match else None
+        # ========== 提取 Staff Code ==========
+        staff_code_patterns = [
+          r"(?:EMPLOYEE\s*/\s*LINE\s*NO\.|LINE\s*NO\.|STAFF\s*CODE)\s*[:\-]?\s*([A-Z]{1,3}\d{1,6}|\d{3,6})",
+          r"\b([A-Z]{1,3}\d{2,6})\b",   # AA02 / AF0001
+          r"\b(\d{4,6})\b"              # 20004
+        ]
+        staff_code = find(staff_code_patterns, text)
+        staff_code = staff_code.upper() if staff_code else "UNKNOWN"
+        print(f"✅ Staff Code 识别：{staff_code}")
 
-        staff_code = find_value(r"EMPLOYEE\s*/\s*LINE\s*NO\.\s*:\s*([A-Z0-9]+)") or "UNKNOWN"
-        basic_pay = find_value(r"Basic\s*Pay\s*([\d\.]+)")
-        ot_hours = find_value(r"HRS/DAY\s*([\d\.]+)")
-        ot_amount = find_value(r"AMOUNT\s*([\d\.]+)")
-        nett_pay = find_value(r"Nett\s*Pay\s*([\d\.]+)")
+        # ========== 关键金额字段（可按需要继续扩展）==========
+        # Basic Pay
+        basic_patterns = [
+          r"BASIC\s*PAY\s*[:\-]?\s*([0-9,]+\.\d{1,2}|[0-9,]+)",
+          r"BASIC\s*RATE\s*[:\-]?\s*([0-9,]+\.\d{1,2}|[0-9,]+)"
+        ]
+        basic_pay = num(find(basic_patterns, text))
 
-        print(f"✅ Staff Code: {staff_code}")
-        print(f"✅ Basic Pay: {basic_pay}")
-        print(f"✅ OT Hours: {ot_hours}")
-        print(f"✅ OT Amount: {ot_amount}")
+        # OT（HRS/DAY & Amount）
+        ot_hours = num(find([r"HRS\s*/\s*DAY\s*[:\-]?\s*([0-9,]+\.\d+|[0-9,]+)",
+                             r"OT\s*HOURS\s*[:\-]?\s*([0-9,]+\.\d+|[0-9,]+)"], text))
+        ot_amount = num(find([r"AMOUNT\s*[:\-]?\s*([0-9,]+\.\d{1,2}|[0-9,]+)",
+                              r"OT\s*AMT\s*[:\-]?\s*([0-9,]+\.\d{1,2}|[0-9,]+)"], text))
+
+        # Nett Pay
+        nett_pay = num(find([r"NETT?\s*PAY\s*[:\-]?\s*([0-9,]+\.\d{1,2}|[0-9,]+)"], text))
+
+        print(f"🧾 基本工资 Basic Pay: {basic_pay}")
+        print(f"⏱️ OT Hours: {ot_hours}")
+        print(f"💵 OT Amount: {ot_amount}")
         print(f"✅ Nett Pay: {nett_pay}")
 
-        # 5. 加载 Excel 模板
-        template = 'SA - Empty.xlsx'
+        # ========== 打开 Excel 模板 ==========
+        template = "SA - Empty.xlsx"
         if not Path(template).exists():
-            raise SystemExit("❌ 没有找到 Excel 模板")
+          raise SystemExit("❌ 找不到 Excel 模板：SA - Empty.xlsx")
         wb = load_workbook(template)
         ws = wb.active
 
-        # 6. 查找 Staff Code 对应行
-        row = None
-        for r in range(2, ws.max_row+1):
-            if ws[f"A{r}"].value and str(ws[f"A{r}"].value).strip() == staff_code:
-                row = r
-                break
-        if not row:
-            raise SystemExit(f"❌ Staff Code {staff_code} 不存在于模板")
+        # ========== 在A列寻找 Staff Code ==========
+        if staff_code == "UNKNOWN":
+          raise SystemExit("❌ Staff Code 识别失败（UNKNOWN），请检查票据文字或正则规则）")
 
-        # 7. 写入对应列（E=Basic Pay, H=OT Hours, I=OT Amount, AK=Nett Pay）
-        if basic_pay: ws[f"E{row}"] = float(basic_pay)
-        if ot_hours: ws[f"H{row}"] = float(ot_hours)
-        if ot_amount: ws[f"I{row}"] = float(ot_amount)
-        if nett_pay: ws[f"AK{row}"] = float(nett_pay)
+        target_row = None
+        for r in range(2, ws.max_row + 1):
+          val = ws[f"A{r}"].value
+          if val and str(val).strip().upper() == staff_code:
+            target_row = r
+            break
+        if not target_row:
+          raise SystemExit(f"❌ Staff Code {staff_code} 不存在于模板（A列）")
 
-        output_file = 'SA - Updated.xlsx'
-        wb.save(output_file)
-        print(f"✅ 生成文件：{output_file}")
+        # ========== 写入对应列 ==========
+        # 你之前指定：E=Basic Pay, H=OT Hours, I=OT Amount, AK=Nett Pay
+        if basic_pay is not None: ws[f"E{target_row}"] = basic_pay
+        if ot_hours is not None:  ws[f"H{target_row}"] = ot_hours
+        if ot_amount is not None: ws[f"I{target_row}"] = ot_amount
+        if nett_pay is not None:  ws[f"AK{target_row}"] = nett_pay
+
+        out_file = "SA - Updated.xlsx"
+        wb.save(out_file)
+        print(f"✅ 已写入并保存：{out_file}")
         EOF
 
     - name: Commit Excel
       run: |
         git config --global user.name "chatgpt-bot"
         git config --global user.email "bot@example.com"
-        git add "SA - Updated.xlsx"
+        git add "SA - Updated.xlsx" || true
         git commit -m "Auto generated Excel from payslip" || echo "No changes"
         git push
