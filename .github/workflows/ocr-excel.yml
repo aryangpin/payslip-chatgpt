@@ -3,12 +3,10 @@ name: Payslip (Claude Vision) → Excel
 on:
   push:
     paths:
-      - '**.jpg'
-      - '**.jpeg'
-      - '**.png'
-      - 'staff_map.csv'
-      - 'prompt.txt'
-      - '.github/workflows/payslip-claude.yml'
+      - "*.jpg"
+      - "*.jpeg"
+      - "*.png"
+      - ".github/workflows/ocr-excel.yml"
 
 jobs:
   run:
@@ -20,11 +18,11 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install deps
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install anthropic pillow openpyxl
 
       - name: Process payslip with Claude
@@ -32,235 +30,188 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           python <<'PY'
-          import os, base64, json, re, csv
+          import os, base64, json, re
           from pathlib import Path
-          from PIL import Image
           from openpyxl import load_workbook
 
-          # ---------- helpers ----------
-          def pick_image():
-              imgs = [p for p in os.listdir('.') if p.lower().endswith(('.jpg','.jpeg','.png'))]
-              if not imgs: raise SystemExit("❌ 没有找到 payslip 图片（.jpg/.png）")
-              imgs.sort()
+          # =============== helpers ===============
+          def pick_latest_image():
+              imgs = [p for p in Path(".").glob("*") if p.suffix.lower() in [".jpg",".jpeg",".png"]]
+              if not imgs:
+                  raise SystemExit("❌ 没有找到 payslip 图片（.jpg/.jpeg/.png）")
+              imgs.sort(key=lambda p: p.stat().st_mtime)
               return imgs[-1]
 
-          def to_b64(path):
-              with open(path,'rb') as f: return base64.b64encode(f.read()).decode('utf-8')
+          def to_b64(path: Path):
+              return base64.b64encode(path.read_bytes()).decode("utf-8")
 
-          def mime(path):
-              ext = Path(path).suffix.lower()
-              return 'image/png' if ext=='.png' else 'image/jpeg'
+          def media_type(path: Path):
+              return "image/png" if path.suffix.lower()==".png" else "image/jpeg"
 
           def to_num(x):
               if x is None: return None
               if isinstance(x,(int,float)): return float(x)
-              x = str(x).replace(',','').strip()
-              try: return float(x)
+              s = str(x).strip().replace(",","")
+              s = re.sub(r"[^\d.\-]","",s)
+              try: return float(s)
               except: return None
 
-          # ---------- optional prompt ----------
-          prompt_rules = ""
-          if Path("prompt.txt").exists():
-              prompt_rules = Path("prompt.txt").read_text(encoding='utf-8', errors='ignore')
+          # =============== config ===============
+          img = pick_latest_image()
+          img_b64 = to_b64(img)
+          mtype = media_type(img)
 
-          img = pick_image()
-          print(f"🎯 Image: {img}")
+          # 允许用户在 repo 放一个 prompt.txt 追加规则（可选）
+          prompt_extra = Path("prompt.txt").read_text(encoding="utf-8", errors="ignore") if Path("prompt.txt").exists() else ""
 
-          # ---------- call Claude Vision ----------
+          SYSTEM_PROMPT = """你是一个工资单(payslip)结构化助手。只从图片中提取指定字段，返回严格 JSON，不要多余文本。
+          识别字段（若无则填 0 或 null）：
+          - staff_code  (同 EMPLOYEE / LINE NO.)
+          - basic_pay
+          - ot_hours      (1.5x 小时, 若只看到金额也可留空)
+          - ot_amount     (1.5x 金额)
+          - ot_total      (加班合计)
+          - incentive     (奖金)
+          - allowance     (各类津贴总和)
+          - total_payable (月总收入)
+          - epf_employer, epf_employee
+          - socso_employer, socso_employee
+          - eis_employer, eis_employee
+          - nett_pay
+          注意：
+          1) staff_code 原样返回，例如 AA02 / AF0001 / 20004 等；不要附加文字。
+          2) 金额与小时返回数字；没看到就用 null。
+          3) 只输出 JSON。"""
+
+          USER_PROMPT = f"""请从下面工资单图片中提取字段，严格输出 JSON。
+          额外规则（可选）：{prompt_extra}
+          """
+
+          # =============== call Claude (fallback chain) ===============
           from anthropic import Anthropic
           client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-          schema = {
-              "type":"object",
-              "properties":{
-                  "staff_code":{"type":"string", "description":"EMPLOYEE / LINE NO. 或 STAFF CODE（如 AA02/AF0001/20004）"},
-                  "basic_pay":{"type":"number"},
-                  "ot_hours":{"type":"number"},
-                  "ot_amount":{"type":"number"},
-                  "ot_total":{"type":"number"},
-                  "incentive":{"type":"number"},
-                  "allowances":{"type":"array","items":{"type":"number"}, "description":"最多5个，按 S..W 列位"},
-                  "total_payable":{"type":"number"},
-                  "epf_employer":{"type":"number"},
-                  "epf_employee":{"type":"number"},
-                  "socso_employer":{"type":"number"},
-                  "socso_employee":{"type":"number"},
-                  "eis_employer":{"type":"number"},
-                  "eis_employee":{"type":"number"},
-                  "nett_pay":{"type":"number"}
-              },
-              "required":["staff_code"]
-          }
+          candidates = [
+              "claude-3-5-sonnet-latest",
+              "claude-3-5-haiku-latest",
+              "claude-3-haiku-20240307",
+          ]
+          last_err = None
+          resp_text = None
 
-          sys_prompt = (
-            "你是工资单抽取助手。"
-            "从图片准确提取字段并严格输出 JSON；小数保留原精度；没找到的字段不要编造，省略即可。"
-            "不要修改姓名和NRIC。"
-            + ("\n规则/备注：\n"+prompt_rules if prompt_rules else "")
-          )
+          for model in candidates:
+              try:
+                  resp = client.messages.create(
+                      model=model,
+                      max_tokens=1500,
+                      temperature=0,
+                      system=SYSTEM_PROMPT,
+                      messages=[{
+                        "role":"user",
+                        "content":[
+                          {"type":"image","source":{"type":"base64","media_type": mtype,"data": img_b64}},
+                          {"type":"text","text": USER_PROMPT}
+                        ]
+                      }]
+                  )
+                  # Claude 可能返回多块，拼起来
+                  txt = "".join(getattr(b,"text","") for b in resp.content if getattr(b,"type",None)=="text")
+                  if not txt:
+                      raise RuntimeError("Claude 没返回文本")
+                  resp_text = txt
+                  print(f"✅ Using model: {model}")
+                  break
+              except Exception as e:
+                  print(f"⚠️ 模型 {model} 调用失败：{e}")
+                  last_err = e
+          if resp_text is None:
+              raise SystemExit(f"❌ 所有候选模型都失败：{last_err}")
 
-          user_text = (
-            "请从这张 payslip 提取字段，严格符合给定 JSON 架构："
-            "staff_code, basic_pay, ot_hours, ot_amount, ot_total, incentive, allowances(至多5), "
-            "total_payable, epf_employer, epf_employee, socso_employer, socso_employee, "
-            "eis_employer, eis_employee, nett_pay。"
-            "注意：staff_code 即 EMPLOYEE/LINE NO. 或 STAFF CODE。"
-          )
-
-          img_b64 = to_b64(img)
-          media_type = mime(img)
-
-          # Claude 3.5 Sonnet（2024-06 之后的稳定版本名，若你有更新的可替换）
-          model_name = "claude-3-5-sonnet-latest"
-
-          resp = client.messages.create(
-              model=model_name,
-              max_tokens=1200,
-              temperature=0,
-              system=sys_prompt,
-              messages=[{
-                  "role":"user",
-                  "content":[
-                      {"type":"image", "source":{"type":"base64", "media_type": media_type, "data": img_b64}},
-                      {"type":"text", "text": user_text}
-                  ]
-              }]
-          )
-
-          # 取文本
-          txt = ""
-          for block in resp.content:
-              if block.type == "text":
-                  txt += block.text
-          if not txt:
-              raise SystemExit("❌ Claude 没返回文本内容")
-
-          # 尝试提取 JSON（容错）
-          def extract_json(s):
-              s = s.strip()
-              # 直接就是 JSON
-              if s.startswith("{") and s.endswith("}"):
-                  return s
-              # 从文本中提取首个 {...}
-              m = re.search(r"\{.*\}", s, flags=re.S)
-              return m.group(0) if m else None
-
-          raw_json = extract_json(txt)
-          if not raw_json:
-              print("⚠️ Claude 返回：\n", txt[:400])
-              raise SystemExit("❌ 未找到JSON响应")
+          # =============== parse JSON ===============
+          s = resp_text.strip()
+          if not (s.startswith("{") and s.endswith("}")):
+              m = re.search(r"\{[\s\S]+\}", s)
+              s = m.group(0) if m else None
+          if not s:
+              print("🟠 Claude 原始输出(前400)：", resp_text[:400])
+              raise SystemExit("❌ 未截取到 JSON")
 
           try:
-              data = json.loads(raw_json)
+              data = json.loads(s)
           except Exception as e:
-              print("⚠️ JSON 解析失败：", e)
-              print(raw_json[:500])
+              print("🟠 JSON 解析失败：", e)
+              print(s[:800])
               raise SystemExit("❌ JSON 不合法")
 
-          # ---------- staff map ----------
-          detected = str(data.get("staff_code","")).strip().upper()
-          if not detected:
-              raise SystemExit("❌ 未识别到 staff_code")
-
-          mapped = detected
-          mp = {}
-          if Path("staff_map.csv").exists():
-              with open("staff_map.csv", newline='', encoding='utf-8') as f:
-                  for row in csv.DictReader(f):
-                      src = (row.get("payslip_code") or "").strip().upper()
-                      dst = (row.get("template_code") or "").strip().upper()
-                      if src and dst: mp[src] = dst
-              if detected in mp:
-                  mapped = mp[detected]
-                  print(f"🔁 staff_code 映射: {detected} → {mapped}")
-
-          # ---------- open Excel ----------
-          tpl = "SA - Empty.xlsx"
-          if not Path(tpl).exists():
+          # =============== open Excel ===============
+          tpl = Path("SA - Empty.xlsx")
+          if not tpl.exists():
               raise SystemExit("❌ 找不到模板：SA - Empty.xlsx")
           wb = load_workbook(tpl)
           ws = wb.active
 
-          # 定位行（A列）
+          # Staff Code 标准化（字符串、去空格、大写）
+          detected = str(data.get("staff_code","")).strip().upper()
+          if not detected:
+              raise SystemExit("❌ 未识别到 staff_code")
+
+          # 在 A 列查找对应行
           row = None
           for r in range(2, ws.max_row+1):
               val = ws[f"A{r}"].value
-              if val and str(val).strip().upper() == mapped:
-                  row = r; break
+              if val is not None and str(val).strip().upper()==detected:
+                  row = r
+                  break
           if not row:
-              # 打印几个样例帮助校对
-              sample = [str(ws[f'A{i}'].value) for i in range(2, min(ws.max_row, 20)+1)]
-              raise SystemExit(f"❌ 模板中找不到 {mapped}；A列样例：{sample[:10]}")
+              # 打印前几行样例帮助排错
+              sample = [str(ws[f"A{i}"].value) for i in range(2, min(ws.max_row, 20)+1)]
+              raise SystemExit(f"❌ 模板 A列 找不到 staff_code={detected}；样例：{sample[:10]}")
 
-          # ---------- 写入列位（按你要求） ----------
+          # =============== 写入各列（按你需求） ===============
           # E: Basic Pay
-          bp = to_num(data.get("basic_pay"))
-          if bp is not None: ws[f"E{row}"] = bp
+          bp = to_num(data.get("basic_pay"));          ws[f"E{row}"] = bp if bp is not None else None
 
           # H/I/R: OT
-          oh = to_num(data.get("ot_hours"))
-          if oh is not None: ws[f"H{row}"] = oh
-          oa = to_num(data.get("ot_amount"))
-          if oa is not None: ws[f"I{row}"] = oa
-          ot_total = to_num(data.get("ot_total"))
-          if ot_total is not None: ws[f"R{row}"] = ot_total
+          oh = to_num(data.get("ot_hours"));           ws[f"H{row}"] = oh if oh is not None else None
+          oa = to_num(data.get("ot_amount"));          ws[f"I{row}"] = oa if oa is not None else None
+          ot_total = to_num(data.get("ot_total"));     ws[f"R{row}"] = ot_total if ot_total is not None else None
 
           # T: Incentive
-          inc = to_num(data.get("incentive"))
-          if inc is not None: ws[f"T{row}"] = inc
+          inc = to_num(data.get("incentive"));         ws[f"T{row}"] = inc if inc is not None else None
 
-          # S..W: Allowances 数组最多5项；W 也常作为 allowance 合计位（如需）
-          allowances = data.get("allowances") or []
-          cols_SW = ["S","T","U","V","W"]  # 注意：T 已用于 incentive；如冲突你可改为 S,U,V,W,? 自行调整
-          # 为避免覆盖 T 的 incentive，这里我们把 Allowances 写入 U..W，并把总额写 W（若你希望如此）
-          # 方案：U..W 放 allowances[0..3]，W 同时可被视为总额（如需总额，用 sum 覆盖 W）
-          # 简化：只把 allowances 总额写 W，避免冲突：
-          if isinstance(allowances, list) and allowances:
-              allow_sum = sum(to_num(x) or 0.0 for x in allowances[:5])
-              ws[f"W{row}"] = allow_sum
+          # W: Allowance(合计)
+          alw = to_num(data.get("allowance"));         ws[f"W{row}"] = alw if alw is not None else None
 
           # X: Total Payable
-          tp = to_num(data.get("total_payable"))
-          if tp is not None: ws[f"X{row}"] = tp
+          tp = to_num(data.get("total_payable"));      ws[f"X{row}"] = tp if tp is not None else None
 
-          # EPF: Y/Z/AA
-          epf_er = to_num(data.get("epf_employer"))
-          epf_ee = to_num(data.get("epf_employee"))
-          if epf_er is not None: ws[f"Y{row}"] = epf_er
-          if epf_ee is not None: ws[f"Z{row}"] = epf_ee
-          if (epf_er is not None) or (epf_ee is not None):
-              if (epf_er is not None) and (epf_ee is not None):
-                  ws[f"AA{row}"] = epf_er + epf_ee
+          # Y/Z/AA: EPF
+          epf_er = to_num(data.get("epf_employer"));   ws[f"Y{row}"] = epf_er if epf_er is not None else None
+          epf_ee = to_num(data.get("epf_employee"));   ws[f"Z{row}"] = epf_ee if epf_ee is not None else None
+          ws[f"AA{row}"] = (epf_er or 0) + (epf_ee or 0) if (epf_er is not None or epf_ee is not None) else None
 
-          # SOCSO: AB/AC/AD
-          socso_er = to_num(data.get("socso_employer"))
-          socso_ee = to_num(data.get("socso_employee"))
-          if socso_er is not None: ws[f"AB{row}"] = socso_er
-          if socso_ee is not None: ws[f"AC{row}"] = socso_ee
-          if (socso_er is not None) and (socso_ee is not None):
-              ws[f"AD{row}"] = socso_er + socso_ee
+          # AB/AC/AD: SOCSO
+          socso_er = to_num(data.get("socso_employer")); ws[f"AB{row}"] = socso_er if socso_er is not None else None
+          socso_ee = to_num(data.get("socso_employee")); ws[f"AC{row}"] = socso_ee if socso_ee is not None else None
+          ws[f"AD{row}"] = (socso_er or 0) + (socso_ee or 0) if (socso_er is not None or socso_ee is not None) else None
 
-          # EIS: AE/AF/AG
-          eis_er = to_num(data.get("eis_employer"))
-          eis_ee = to_num(data.get("eis_employee"))
-          if eis_er is not None: ws[f"AE{row}"] = eis_er
-          if eis_ee is not None: ws[f"AF{row}"] = eis_ee
-          if (eis_er is not None) and (eis_ee is not None):
-              ws[f"AG{row}"] = eis_er + eis_ee
+          # AE/AF/AG: EIS
+          eis_er = to_num(data.get("eis_employer"));   ws[f"AE{row}"] = eis_er if eis_er is not None else None
+          eis_ee = to_num(data.get("eis_employee"));   ws[f"AF{row}"] = eis_ee if eis_ee is not None else None
+          ws[f"AG{row}"] = (eis_er or 0) + (eis_ee or 0) if (eis_er is not None or eis_ee is not None) else None
 
           # AK: Nett Pay
-          np = to_num(data.get("nett_pay"))
-          if np is not None: ws[f"AK{row}"] = np
+          nett = to_num(data.get("nett_pay"));         ws[f"AK{row}"] = nett if nett is not None else None
 
-          out = "SA - Updated.xlsx"
+          out = Path("SA - Updated.xlsx")
           wb.save(out)
-          print(f"✅ 已保存：{out}（行 {row} / Staff Code: {mapped}，原识别：{detected}）")
+          print(f"✅ 已写入 {out}；匹配 staff_code={detected}，行={row}；图片={img.name}")
           PY
 
       - name: Commit result
         run: |
-          git config --global user.name "chatgpt-bot"
-          git config --global user.email "bot@example.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add "SA - Updated.xlsx" || true
-          git commit -m "Claude Vision → Excel (auto)" || echo "No changes"
+          git commit -m "Update SA - Updated.xlsx (auto from payslip)" || echo "nothing to commit"
           git push
