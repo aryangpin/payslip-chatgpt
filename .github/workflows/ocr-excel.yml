@@ -111,7 +111,7 @@ jobs:
           media_type = mime(img)
 
           # Claude 3.5 Sonnet（2024-06 之后的稳定版本名，若你有更新的可替换）
-          model_name = "claude-3-5-sonnet-20240620"
+          model_name = "claude-3-5-sonnet-latest"
 
           resp = client.messages.create(
               model=model_name,
