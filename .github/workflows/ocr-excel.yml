@@ -62,7 +62,7 @@ jobs:
             match = re.search(pattern, text)
             return match.group(1) if match else None
 
-        staff_code = find_value(r"(AF\d{4}|AA\d{2}|A\d{3})") or "UNKNOWN"
+        staff_code = find_value(r"EMPLOYEE\s*/\s*LINE\s*NO\.\s*:\s*([A-Z0-9]+)") or "UNKNOWN"
         basic_pay = find_value(r"Basic\s*Pay\s*([\d\.]+)")
         ot_hours = find_value(r"HRS/DAY\s*([\d\.]+)")
         ot_amount = find_value(r"AMOUNT\s*([\d\.]+)")
